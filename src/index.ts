@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { generate_jwt, extract_csr } from './helpers'
+import { jwtVerify } from 'jose'
 import { Agent } from 'https'
 
 const agent = new Agent({
@@ -15,21 +16,44 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-const signSchema = z.object({
-  csr: z.string(),
-  token: z.string().optional(),
-})
-
 app.post('/sign', async (c) => {
-  const body = await c.req.json()
+  const body = await c.req.parseBody()
 
-  const parsed = signSchema.safeParse(body)
-  if (!parsed.success) {
-    return c.text('Invalid request!', 400)
+  if (!body || !body['csr']) {
+    return c.text('Missing CSR!', 400)
   }
 
-  const { csr, token } = parsed.data
+  //auth header
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader) {
+    return c.text('Missing Authorization header!', 400)
+  }
+  const token = authHeader.split(' ')[1]
+
+  const csr = await (body['csr'] as File).text()
   const data = await extract_csr(csr)
+
+  if (!data) {
+    return c.text('Invalid CSR!', 400)
+  }
+
+  //verify the token
+  const tokenSecret = new TextEncoder().encode(c.env.TOKEN_SECRET)
+  const { payload } = await jwtVerify(token, tokenSecret, {
+    audience: 'pki-api',
+    algorithms: ['HS256'],
+  }).catch((err) => {
+    console.error('JWT verification failed:', err)
+    return { payload: null }
+  })
+
+  if (!payload) {
+    return c.text('Invalid token!', 400)
+  }
+
+  if (!payload.sub || payload.sub !== data.commonName) {
+    return c.text('Invalid token subject!', 400)
+  }
 
   const jwk = c.env.PROVISIONING_JWK
 
@@ -62,19 +86,20 @@ app.post('/sign', async (c) => {
 
   if (!resp.ok) {
     const text = await resp.text()
-    return c.json({
-      issued: false,
-      cert: "",
-      error: text,
-    })
+    return c.text(`Error signing CSR: ${text}`, 500)
   }
 
   const respData: any = await resp.json()
 
-  return c.json({
-    cert: respData.crt,
-    issued: true
-  })
+  //return it as a file download
+  const pem = respData.crt
+
+  c.res.headers.set('Content-Type', 'application/x-x509-ca-cert')
+  c.res.headers.set('Content-Disposition', `attachment; filename="leaf.crt"`)
+  c.res.headers.set('Content-Length', pem.length)
+  c.res.headers.set('Cache-Control', 'no-store')
+
+  return c.body(pem, 200)
 })
 
 app.get('/', async (c) => {
