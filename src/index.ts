@@ -103,9 +103,7 @@ app.post('/sign', async (c) => {
 })
 
 app.get('/', async (c) => {
-  return c.json({
-    message: 'Hello World!',
-  })
+  return c.redirect("https://github.com/koiosdigital/device-provisioning-api")
 })
 
 export default app
