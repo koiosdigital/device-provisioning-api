@@ -158,7 +158,7 @@ app.get('/ds_params', async (c) => {
   }
 
   //@ts-expect-error - we're not typing cause we're lazy
-  return c.json(data.ds_json);
+  return c.json(JSON.parse(data.ds_json));
 });
 
 app.get('/', async (c) => {
