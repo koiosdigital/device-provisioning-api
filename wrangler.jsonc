@@ -3,5 +3,12 @@
   "name": "kd-device-provisioning-api",
   "main": "src/index.ts",
   "compatibility_date": "2025-04-17",
-  "compatibility_flags": ["nodejs_compat"]
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "d1_databases": [
+    {
+      "binding": "db",
+      "database_id": "d8472fab-dd72-4574-841e-c247d71970b8"
+    }
+  ]
 }
