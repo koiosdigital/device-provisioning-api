@@ -1,9 +1,10 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { generate_jwt, extract_csr } from './helpers'
-import { jwtVerify } from 'jose'
 import { Agent } from 'https'
 import { type D1Database } from '@cloudflare/workers-types'
+import { verifyFromJwks } from 'hono/utils/jwt/jwt'
+import { cors } from 'hono/cors'
 
 const agent = new Agent({
   rejectUnauthorized: false
@@ -12,7 +13,7 @@ const agent = new Agent({
 type Bindings = {
   PROVISIONING_JWK: string
   STEP_CA_HOST: string
-  TOKEN_SECRET: string
+  OIDC_ISSUER: string
   db: D1Database
 }
 
@@ -25,60 +26,79 @@ const dsParamsSchema = z.object({
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-app.post('/sign', async (c) => {
+//cors
+app.use("*", cors());
+
+//define middleware to check if the request is authenticated
+app.use('/v1/factory/*', async (c, next) => {
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader) {
+    return c.text('Missing Authorization header', 401)
+  }
+  const token = authHeader.split(' ')[1]
+  if (!token) {
+    return c.text('Missing token', 401)
+  }
+  const issuer = c.env.OIDC_ISSUER
+  const issuerResponse = await fetch(`${issuer}/.well-known/openid-configuration`);
+  if (!issuerResponse.ok) {
+    return c.text('Error fetching issuer JWKS!', 500)
+  }
+  const issuerData = await issuerResponse.json() as any
+  const keys = issuerData.jwks_uri;
+
+  try {
+    const payload = await verifyFromJwks(token, {
+      jwks_uri: keys,
+    });
+    if (!payload) {
+      return c.text('Invalid token', 401)
+    }
+    const roles = payload['roles'] as string[]
+    console.log(payload);
+    if (!roles || !roles.includes('koios-factory')) {
+      return c.text('User unauthorized', 403)
+    }
+  } catch (e) {
+    console.error(e)
+    return c.text('Invalid token', 401)
+  }
+  return next()
+})
+
+app.post('/v1/factory/provision', async (c) => {
   const body = await c.req.parseBody()
 
   if (!body || !body['csr']) {
     return c.text('Missing CSR!', 400)
   }
 
-  //auth header
-  const authHeader = c.req.header('Authorization')
-  if (!authHeader) {
-    return c.text('Missing Authorization header!', 400)
-  }
-  const token = authHeader.split(' ')[1]
-
   const csr = await (body['csr'] as File).text()
-  const data = await extract_csr(csr)
 
-  if (!data) {
+  let cn = "";
+  try {
+    const data = await extract_csr(csr)
+
+    if (!data) {
+      return c.text('Invalid CSR!', 400)
+    }
+
+    cn = data.commonName
+  } catch (e) {
     return c.text('Invalid CSR!', 400)
   }
 
-  //verify the token
-  const tokenSecret = new TextEncoder().encode(c.env.TOKEN_SECRET)
-  const { payload } = await jwtVerify(token, tokenSecret, {
-    audience: 'pki-api',
-    algorithms: ['HS256'],
-  }).catch((err) => {
-    console.error('JWT verification failed:', err)
-    return { payload: null }
-  })
-
-  if (!payload) {
-    return c.text('Invalid token!', 400)
-  }
-
-  if (!payload.sub || payload.sub !== data.commonName) {
-    return c.text('Invalid token subject!', 400)
-  }
-
   const jwk = c.env.PROVISIONING_JWK
-
-  const audience = `${c.env.STEP_CA_HOST}/1.0/sign`
-  const issuer = "provisioner"
-
   const jwt = await generate_jwt(
-    data.commonName,
+    cn,
     [],
-    audience,
-    issuer,
+    `${c.env.STEP_CA_HOST}/1.0/sign`,
+    "provisioner",
     jwk
   )
 
   //sign the CSR
-  const resp = await fetch(audience, {
+  const resp = await fetch(`${c.env.STEP_CA_HOST}/1.0/sign`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
@@ -111,7 +131,7 @@ app.post('/sign', async (c) => {
   return c.body(pem, 200)
 })
 
-app.post('/ds_params', async (c) => {
+app.post('/v1/ds_params', async (c) => {
   const device_id = c.req.header('x-device-id')
 
   if (!device_id) {
@@ -144,7 +164,7 @@ app.post('/ds_params', async (c) => {
   });
 });
 
-app.get('/ds_params', async (c) => {
+app.get('/v1/ds_params', async (c) => {
   const device_id = c.req.header('x-device-id')
 
   if (!device_id) {
