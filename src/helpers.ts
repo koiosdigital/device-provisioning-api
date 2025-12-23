@@ -1,30 +1,53 @@
-import { importJWK, SignJWT } from "jose"
-import * as forge from "node-forge"
+import { importJWK, SignJWT, type JWK } from 'jose'
+import * as forge from 'node-forge'
+import { csrMetadataSchema } from './types'
 
-export async function extract_csr(pem: string) {
-    const csr = forge.pki.certificationRequestFromPem(pem);
+export async function extractCsr(pem: string) {
+    const sanitizedPem = pem.trim()
+    if (!sanitizedPem) {
+        throw new Error('CSR payload is empty')
+    }
 
-    const commonName = csr.subject.getField('CN').value
+    const csr = forge.pki.certificationRequestFromPem(sanitizedPem)
+    const field = csr.subject.getField('CN')
+    if (!field || !field.value) {
+        throw new Error('CSR missing common name')
+    }
 
-    return { commonName }
+    return csrMetadataSchema.parse({ commonName: String(field.value).trim() })
 }
 
-export async function generate_jwt(cn: string, dnsSANs: string[], audience: string, issuer: string, jwk: string) {
-    // make the jwk
-    const jwkJSON = await JSON.parse(jwk)
-    const privateKey = await importJWK(jwkJSON)
-    const kid = jwkJSON.kid
+type GenerateJwtInput = {
+    commonName: string
+    subjectAlternativeNames?: string[]
+    audience: string
+    issuer: string
+    jwk: string
+}
+
+export async function generateJwt(input: GenerateJwtInput) {
+    let jwkJson: JWK & { kid?: string; alg?: string }
+    try {
+        jwkJson = JSON.parse(input.jwk)
+    } catch (error) {
+        throw new Error('Provisioning key is not valid JSON')
+    }
+
+    const algorithm = typeof jwkJson.alg === 'string' ? jwkJson.alg : 'ES256'
+    const key = await importJWK(jwkJson, algorithm)
+    const sans = (input.subjectAlternativeNames ?? []).map((name) => name.trim()).filter(Boolean)
 
     const jwt = await new SignJWT({
-        sans: dnsSANs,
-        sub: cn,
+        sans,
+        sub: input.commonName
     })
-        .setProtectedHeader({ alg: 'ES256', kid: kid })
+        .setProtectedHeader({ alg: algorithm, kid: jwkJson.kid })
         .setIssuedAt()
-        .setIssuer("provisioner")
-        .setAudience(audience)
+        .setIssuer(input.issuer)
+        .setAudience(input.audience)
         .setNotBefore('0s')
         .setExpirationTime('5m')
-        .sign(privateKey)
+        .sign(key)
+
     return jwt
 }
