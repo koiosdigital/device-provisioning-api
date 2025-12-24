@@ -17,7 +17,6 @@ export const deviceIdSchema = z
     .min(3, 'device id too short')
     .max(128, 'device id too long')
     .regex(/^[A-Za-z0-9:_-]+$/, 'device id contains invalid characters')
-    .transform((value) => value.toLowerCase())
 
 export const csrBodySchema = z.object({
     csr: z.string().trim().min(1).max(12000)

@@ -1,188 +1,228 @@
 import { Hono } from 'hono'
-import { z } from 'zod'
-import { generate_jwt, extract_csr } from './helpers'
-import { Agent } from 'https'
-import { type D1Database } from '@cloudflare/workers-types'
-import { verifyFromJwks } from 'hono/utils/jwt/jwt'
+import type { Context } from 'hono'
 import { cors } from 'hono/cors'
+import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { extractCsr, generateJwt } from './helpers'
+import {
+  csrBodySchema,
+  deviceIdSchema,
+  dsParamsSchema,
+  swaggerDocument,
+  type CloudflareBindings,
+  type DsParams
+} from './types'
 
-const agent = new Agent({
-  rejectUnauthorized: false
-})
+const app = new Hono<{ Bindings: CloudflareBindings }>()
+const issuerJwksCache = new Map<string, string>()
 
-type Bindings = {
-  PROVISIONING_JWK: string
-  STEP_CA_HOST: string
-  OIDC_ISSUER: string
-  db: D1Database
-}
+type ErrorStatus = 400 | 401 | 403 | 404 | 422 | 429 | 500 | 502
 
-const dsParamsSchema = z.object({
-  ds_key_id: z.number().min(1).max(7),
-  rsa_len: z.number().min(31).max(128),
-  cipher_c: z.string().base64(),
-  iv: z.string().base64()
-});
+const jsonError = (c: Context, status: ErrorStatus, message: string) => c.json({ error: message }, status)
 
-const app = new Hono<{ Bindings: Bindings }>()
-
-//cors
-app.use("*", cors());
-
-//define middleware to check if the request is authenticated
-app.use('/v1/factory/*', async (c, next) => {
-  const authHeader = c.req.header('Authorization')
-  if (!authHeader) {
-    return c.text('Missing Authorization header', 401)
+async function resolveIssuerJwks(issuer: string) {
+  const normalizedIssuer = issuer.trim().replace(/\/+$/, '')
+  if (issuerJwksCache.has(normalizedIssuer)) {
+    return issuerJwksCache.get(normalizedIssuer) as string
   }
-  const token = authHeader.split(' ')[1]
-  if (!token) {
-    return c.text('Missing token', 401)
-  }
-  const issuer = c.env.OIDC_ISSUER
-  const issuerResponse = await fetch(`${issuer}/.well-known/openid-configuration`);
-  if (!issuerResponse.ok) {
-    return c.text('Error fetching issuer JWKS!', 500)
-  }
-  const issuerData = await issuerResponse.json() as any
-  const keys = issuerData.jwks_uri;
 
   try {
-    const payload = await verifyFromJwks(token, {
-      jwks_uri: keys,
-    });
-    if (!payload) {
-      return c.text('Invalid token', 401)
-    }
-    const roles = payload['roles'] as string[]
-    console.log(payload);
-    if (!roles || !roles.includes('koios-factory')) {
-      return c.text('User unauthorized', 403)
-    }
-  } catch (e) {
-    console.error(e)
-    return c.text('Invalid token', 401)
+    new URL(normalizedIssuer)
+  } catch (error) {
+    throw new Error('OIDC issuer is not a valid URL')
   }
-  return next()
+
+  const discoveryUrl = `${normalizedIssuer}/.well-known/openid-configuration`
+  const response = await fetch(discoveryUrl, {
+    headers: { Accept: 'application/json' }
+  })
+  if (!response.ok) {
+    throw new Error('Unable to fetch OIDC discovery document')
+  }
+
+  const json = await response.json() as { jwks_uri?: string }
+  if (!json.jwks_uri) {
+    throw new Error('OIDC discovery document missing jwks_uri')
+  }
+
+  issuerJwksCache.set(normalizedIssuer, json.jwks_uri)
+  return json.jwks_uri
+}
+
+app.use(
+  '*',
+  cors({
+    origin: '*',
+    allowHeaders: ['Authorization', 'Content-Type', 'x-device-id'],
+    allowMethods: ['GET', 'POST', 'OPTIONS']
+  })
+)
+
+app.onError((err, c) => {
+  console.error(err)
+  return jsonError(c, 500, 'Unexpected error')
+})
+
+app.get('/swagger.json', (c) => {
+  c.header('Cache-Control', 'no-store')
+  return c.json(swaggerDocument)
+})
+
+app.use('/v1/factory/*', async (c, next) => {
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader?.startsWith('Bearer ')) {
+    return jsonError(c, 401, 'Missing Authorization header')
+  }
+
+  const token = authHeader.slice('Bearer '.length).trim()
+  if (!token) {
+    return jsonError(c, 401, 'Missing token')
+  }
+
+  try {
+    const jwksUri = await resolveIssuerJwks(c.env.OIDC_ISSUER)
+    const jwks = createRemoteJWKSet(new URL(jwksUri))
+    const { payload } = await jwtVerify(token, jwks, { issuer: c.env.OIDC_ISSUER })
+    const roles = Array.isArray(payload?.roles) ? (payload.roles as string[]) : []
+    if (!roles.includes('koios-factory')) {
+      return jsonError(c, 403, 'User unauthorized')
+    }
+  } catch (error) {
+    console.error(error)
+    return jsonError(c, 401, 'Invalid token')
+  }
+
+  await next()
 })
 
 app.post('/v1/factory/provision', async (c) => {
-  const body = await c.req.parseBody()
+  const formData = await c.req.parseBody()
+  const csrField = formData?.['csr']
 
-  if (!body || !body['csr']) {
-    return c.text('Missing CSR!', 400)
+  let csrValue: string | undefined
+  if (typeof csrField === 'string') {
+    csrValue = csrField
+  } else if (csrField instanceof File) {
+    csrValue = await csrField.text()
   }
 
-  const csr = await (body['csr'] as File).text()
+  const csrValidation = csrBodySchema.safeParse({ csr: csrValue })
+  if (!csrValidation.success) {
+    const message = csrValidation.error.issues[0]?.message ?? 'Invalid CSR'
+    return jsonError(c, 400, message)
+  }
 
-  let cn = "";
+  let cn: string
   try {
-    const data = await extract_csr(csr)
-
-    if (!data) {
-      return c.text('Invalid CSR!', 400)
-    }
-
-    cn = data.commonName
-  } catch (e) {
-    return c.text('Invalid CSR!', 400)
+    const metadata = await extractCsr(csrValidation.data.csr)
+    cn = metadata.commonName
+  } catch (error) {
+    console.error(error)
+    return jsonError(c, 400, 'Invalid CSR')
   }
 
-  const jwk = c.env.PROVISIONING_JWK
-  const jwt = await generate_jwt(
-    cn,
-    [],
-    `${c.env.STEP_CA_HOST}/1.0/sign`,
-    "provisioner",
-    jwk
-  )
+  const signUrl = new URL('/1.0/sign', c.env.STEP_CA_HOST)
 
-  //sign the CSR
-  const resp = await fetch(`${c.env.STEP_CA_HOST}/1.0/sign`, {
+  let token: string
+  try {
+    token = await generateJwt({
+      commonName: cn,
+      subjectAlternativeNames: [],
+      audience: signUrl.toString(),
+      issuer: 'provisioner',
+      jwk: c.env.PROVISIONING_JWK
+    })
+  } catch (error) {
+    console.error(error)
+    return jsonError(c, 500, 'Unable to generate provisioning token')
+  }
+
+  const response = await fetch(signUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      csr,
-      ott: jwt,
-      notAfter: '262800h'
-    }),
-
-    // @ts-ignore
-    agent: agent,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ csr: csrValidation.data.csr, ott: token, notAfter: '262800h' })
   })
 
-  if (!resp.ok) {
-    const text = await resp.text()
-    return c.text(`Error signing CSR: ${text}`, 500)
+  if (!response.ok) {
+    const details = await response.text()
+    return jsonError(c, 502, `Error signing CSR: ${details}`)
   }
 
-  const respData: any = await resp.json()
+  const payload = await response.json() as { crt?: string }
+  if (!payload.crt) {
+    return jsonError(c, 502, 'Signer returned an invalid payload')
+  }
 
-  //return it as a file download
-  const pem = respData.crt
+  c.header('Content-Type', 'application/x-x509-ca-cert')
+  c.header('Content-Disposition', 'attachment; filename="leaf.crt"')
+  c.header('Cache-Control', 'no-store')
 
-  c.res.headers.set('Content-Type', 'application/x-x509-ca-cert')
-  c.res.headers.set('Content-Disposition', `attachment; filename="leaf.crt"`)
-  c.res.headers.set('Content-Length', pem.length)
-  c.res.headers.set('Cache-Control', 'no-store')
-
-  return c.body(pem, 200)
+  return c.body(payload.crt, 200)
 })
 
 app.post('/v1/ds_params', async (c) => {
-  const device_id = c.req.header('x-device-id')
-
-  if (!device_id) {
-    return c.text('Missing device_id!', 400)
+  const header = c.req.header('x-device-id') ?? ''
+  const deviceIdResult = deviceIdSchema.safeParse(header)
+  if (!deviceIdResult.success) {
+    return jsonError(c, 400, 'Invalid or missing device_id header')
   }
 
-  const json = await c.req.json()
-
-  if (!device_id) {
-    return c.text('Missing device_id!', 400)
+  let json: unknown
+  try {
+    json = await c.req.json()
+  } catch (error) {
+    return jsonError(c, 400, 'Body must be JSON')
   }
 
-  const dsParams = dsParamsSchema.safeParse(json)
-  if (!dsParams.success) {
-    return c.text('Invalid ds_params!', 400)
+  const paramsResult = dsParamsSchema.safeParse(json)
+  if (!paramsResult.success) {
+    return jsonError(c, 400, 'Invalid ds_params payload')
   }
 
-  //check if the device_id exists in the database
-  const data = await c.env.db.prepare('SELECT * FROM ds_data WHERE device_id = ?').bind(device_id).first()
-  if (data) {
-    return c.json({
-      status: 'ok',
-    });
+  const deviceId = deviceIdResult.data
+  const existing = await c.env.db
+    .prepare('SELECT ds_json FROM ds_data WHERE device_id = ?')
+    .bind(deviceId)
+    .first<{ ds_json: string }>()
+
+  if (existing) {
+    return c.json({ status: 'exists' })
   }
 
-  //insert the device_id into the database
-  await c.env.db.prepare('INSERT INTO ds_data (device_id, ds_json) VALUES (?, ?)').bind(device_id, JSON.stringify(dsParams.data)).run()
-  return c.json({
-    status: 'ok',
-  });
-});
+  await c.env.db
+    .prepare('INSERT INTO ds_data (device_id, ds_json) VALUES (?, ?)')
+    .bind(deviceId, JSON.stringify(paramsResult.data))
+    .run()
+
+  return c.json({ status: 'created' })
+})
 
 app.get('/v1/ds_params', async (c) => {
-  const device_id = c.req.header('x-device-id')
-
-  if (!device_id) {
-    return c.text('Missing device_id!', 400)
+  const header = c.req.header('x-device-id') ?? ''
+  const deviceIdResult = deviceIdSchema.safeParse(header)
+  if (!deviceIdResult.success) {
+    return jsonError(c, 400, 'Invalid or missing device_id header')
   }
 
-  //check if the device_id exists in the database
-  const data = await c.env.db.prepare('SELECT * FROM ds_data WHERE device_id = ?').bind(device_id).first()
-  if (!data) {
-    return c.text('Device not found!', 404)
+  const row = await c.env.db
+    .prepare('SELECT ds_json FROM ds_data WHERE device_id = ?')
+    .bind(deviceIdResult.data)
+    .first<{ ds_json: string }>()
+
+  if (!row) {
+    return jsonError(c, 404, 'Device not found')
   }
 
-  //@ts-expect-error - we're not typing cause we're lazy
-  return c.json(JSON.parse(data.ds_json));
-});
+  let parsed: DsParams
+  try {
+    parsed = dsParamsSchema.parse(JSON.parse(row.ds_json))
+  } catch (error) {
+    console.error('Corrupt ds_json payload for device', deviceIdResult.data, error)
+    return jsonError(c, 500, 'Stored device parameters are invalid')
+  }
 
-app.get('/', async (c) => {
-  return c.redirect("https://github.com/koiosdigital/device-provisioning-api")
+  return c.json(parsed)
 })
+
+app.get('/', (c) => c.redirect('https://github.com/koiosdigital/device-provisioning-api'))
 
 export default app
