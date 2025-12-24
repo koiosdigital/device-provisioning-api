@@ -83,7 +83,8 @@ app.use('/v1/factory/*', async (c, next) => {
     const jwks = createRemoteJWKSet(new URL(jwksUri))
     const { payload } = await jwtVerify(token, jwks, { issuer: c.env.OIDC_ISSUER })
     const roles = Array.isArray(payload?.roles) ? (payload.roles as string[]) : []
-    if (!roles.includes('koios-factory')) {
+    const groups = Array.isArray(payload?.groups) ? (payload.groups as string[]) : []
+    if (!roles.includes('koios-factory') && !groups.includes('koios-factory')) {
       return jsonError(c, 403, 'User unauthorized')
     }
   } catch (error) {
