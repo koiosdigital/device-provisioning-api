@@ -4,8 +4,8 @@ import { randomBytes } from 'node:crypto'
 // Map of key_type to Stripe Price ID
 // Update these with your actual Stripe Price IDs
 export const KEY_TYPE_TO_PRICE_ID: Record<string, string> = {
-    'matrx': 'price_1SiRylAgCDl6UP1XlZWUWmg1',      // Replace with actual Stripe Price ID
-    'lantern': 'price_1SiRylAgCDl6UP1XlZWUWmg1',    // Replace with actual Stripe Price ID
+    'matrx': 'price_1RKPK1AgCDl6UP1XeXfY5nJp',      // Replace with actual Stripe Price ID
+    'lantern': 'price_1SiMuWAgCDl6UP1X95EVJr8B',    // Replace with actual Stripe Price ID
 }
 
 export function generateLicenseKey(): string {
