@@ -10,5 +10,8 @@
       "binding": "db",
       "database_id": "d8472fab-dd72-4574-841e-c247d71970b8"
     }
-  ]
+  ],
+  "vars": {
+    "ALLOWED_RETURN_DOMAINS": "http://localhost:5173,https://app.koiosdigital.net"
+  }
 }
